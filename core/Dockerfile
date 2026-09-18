@@ -29,14 +29,11 @@ WORKDIR /src
 
 # Cache module downloads in a separate layer.
 COPY go.mod go.sum ./
-RUN --mount=type=cache,id=gomod,target=/go/pkg/mod \
-    go mod download
+RUN go mod download
 
 COPY . .
 
-RUN --mount=type=cache,id=gomod,target=/go/pkg/mod \
-    --mount=type=cache,id=gobuild,target=/root/.cache/go-build \
-    go build \
+RUN go build \
         -trimpath \
         -ldflags="-s -w -X main.version=${VERSION}" \
         -o /out/posthorn \
