@@ -33,6 +33,8 @@ var (
 //   - On *TransportError with class ErrTransient: wait 1s, retry once.
 //   - On *TransportError with class ErrRateLimited: wait 5s, retry once.
 //   - On any class ErrTerminal (or non-TransportError): no retry.
+//   - On ErrQuotaExceeded: no retry — the quota can't reset within
+//     the caller's timeout.
 //   - The provided ctx carries the caller's hard timeout (FR22);
 //     if it expires during the backoff, the second attempt is skipped.
 //
@@ -57,7 +59,7 @@ func SendWithRetry(ctx context.Context, t Transport, msg Message, logger *slog.L
 	case ErrRateLimited:
 		delay = RateLimitedRetryDelay
 	default:
-		// ErrTerminal, ErrUnknown — no retry.
+		// ErrTerminal, ErrQuotaExceeded, ErrUnknown — no retry.
 		return SendResult{}, err
 	}
 

@@ -94,6 +94,7 @@ func TestErrorClass_String(t *testing.T) {
 		{ErrTransient, "transient"},
 		{ErrRateLimited, "rate_limited"},
 		{ErrTerminal, "terminal"},
+		{ErrQuotaExceeded, "quota_exceeded"},
 		{ErrorClass(99), "unknown"}, // out-of-range falls back to unknown
 	}
 	for _, tt := range tests {

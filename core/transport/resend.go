@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sync"
 	"time"
 )
 
@@ -47,7 +48,24 @@ type ResendTransport struct {
 	// BaseURL is the API base. Empty means use the production default.
 	// Tests set this to an httptest.NewServer URL; production never sets it.
 	BaseURL string
+
+	// quotaErr is the last daily_quota_exceeded error, kept until its
+	// RetryAfter passes. While set, Send fails fast with it instead of
+	// calling Resend: no send can succeed before the quota resets.
+	quotaMu  sync.Mutex
+	quotaErr *TransportError
 }
+
+// Resend's 429 error names (https://resend.com/docs/api-reference/errors).
+// Any other 429 (rate_limit_exceeded) is a per-second limit, not a quota.
+const (
+	resendDailyQuotaExceeded   = "daily_quota_exceeded"
+	resendMonthlyQuotaExceeded = "monthly_quota_exceeded"
+)
+
+// resendNow is the clock used for quota reset times. A var so tests can
+// pin it; production never mutates it.
+var resendNow = time.Now
 
 // NewResendTransport constructs a transport. baseURL may be empty.
 func NewResendTransport(apiKey, baseURL string) *ResendTransport {
@@ -102,11 +120,17 @@ type resendErrorResponse struct {
 // Status code mapping (FR19-21 parallel to Postmark):
 //
 //	200        → success (parse `id` for MessageID)
-//	429        → ErrRateLimited
+//	429 daily_quota_exceeded   → ErrQuotaExceeded, RetryAfter = next 00:00 UTC
+//	429 monthly_quota_exceeded → ErrQuotaExceeded, RetryAfter unknown
+//	429 (other)→ ErrRateLimited
 //	5xx        → ErrTransient
 //	4xx (other)→ ErrTerminal
 //	network/timeout/ctx → ErrTransient (caller will retry once)
 func (r *ResendTransport) Send(ctx context.Context, msg Message) (SendResult, error) {
+	if te := r.activeQuotaError(); te != nil {
+		return SendResult{}, te
+	}
+
 	body := resendRequest{
 		From:    msg.From,
 		To:      msg.To,
@@ -160,11 +184,7 @@ func (r *ResendTransport) Send(ctx context.Context, msg Message) (SendResult, er
 		return SendResult{MessageID: resendMessageID(respBody)}, nil
 
 	case resp.StatusCode == http.StatusTooManyRequests:
-		return SendResult{}, &TransportError{
-			Class:   ErrRateLimited,
-			Status:  resp.StatusCode,
-			Message: resendErrorMessage(respBody, "resend rate limit"),
-		}
+		return SendResult{}, r.tooManyRequestsError(respBody)
 
 	case resp.StatusCode >= 500:
 		return SendResult{}, &TransportError{
@@ -187,6 +207,60 @@ func (r *ResendTransport) Send(ctx context.Context, msg Message) (SendResult, er
 			Message: fmt.Sprintf("unexpected resend status %d", resp.StatusCode),
 		}
 	}
+}
+
+// tooManyRequestsError classifies a 429 by Resend's error name: a used-up
+// quota can't succeed until it resets, unlike a per-second rate limit.
+// A daily quota error is cached so later sends fail fast until midnight UTC.
+func (r *ResendTransport) tooManyRequestsError(body []byte) *TransportError {
+	te := &TransportError{
+		Class:   ErrRateLimited,
+		Status:  http.StatusTooManyRequests,
+		Message: resendErrorMessage(body, "resend rate limit"),
+	}
+
+	var resp resendErrorResponse
+	_ = json.Unmarshal(body, &resp)
+	switch resp.Name {
+	case resendDailyQuotaExceeded:
+		// Resend resets the daily quota at midnight UTC.
+		te.Class = ErrQuotaExceeded
+		te.RetryAfter = nextUTCMidnight(resendNow())
+
+		cached := *te
+		r.quotaMu.Lock()
+		r.quotaErr = &cached
+		r.quotaMu.Unlock()
+
+	case resendMonthlyQuotaExceeded:
+		// The monthly reset date isn't in the response; leave RetryAfter
+		// zero so the client pauses rather than guessing.
+		te.Class = ErrQuotaExceeded
+	}
+	return te
+}
+
+// activeQuotaError returns a copy of the cached daily quota error while its
+// reset time is still ahead, or nil once it has passed.
+func (r *ResendTransport) activeQuotaError() *TransportError {
+	r.quotaMu.Lock()
+	defer r.quotaMu.Unlock()
+
+	if r.quotaErr == nil {
+		return nil
+	}
+	if !resendNow().Before(r.quotaErr.RetryAfter) {
+		r.quotaErr = nil
+		return nil
+	}
+	te := *r.quotaErr
+	return &te
+}
+
+// nextUTCMidnight returns the first 00:00 UTC strictly after t.
+func nextUTCMidnight(t time.Time) time.Time {
+	u := t.UTC()
+	return time.Date(u.Year(), u.Month(), u.Day()+1, 0, 0, 0, 0, time.UTC)
 }
 
 // resendMessageID extracts the `id` field from a 200 response body. Returns

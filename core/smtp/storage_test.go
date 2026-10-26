@@ -112,6 +112,29 @@ func TestSMTP_Storage_TransientExhaustion_Queues250(t *testing.T) {
 	}
 }
 
+func TestSMTP_Storage_QuotaExceeded_451NotQueued(t *testing.T) {
+	// Queueing a quota failure would answer 250 and let the client push
+	// its whole backlog into the queue, bypassing its own pacing. The
+	// client must see the 451 and hold its sends instead.
+	f := startListener(t, baseTestConfig())
+	gate := attachTestGate(t, f)
+	f.mt.errQueue = []error{
+		&transport.TransportError{Class: transport.ErrQuotaExceeded, Status: 429, Message: "daily quota"},
+	}
+
+	code, msg := deliverBasic(t, f)
+	if code != 451 || !strings.Contains(msg, "quota_exceeded") {
+		t.Fatalf("DATA reply = %d %q, want 451 quota_exceeded", code, msg)
+	}
+	subs, _ := gate.Store().ListSubmissions(10)
+	if len(subs) != 1 || subs[0].Status != storage.StatusFailed {
+		t.Fatalf("row = %+v", subs)
+	}
+	if n, _ := gate.Store().QueueDepth(); n != 0 {
+		t.Errorf("queue depth = %d, want 0", n)
+	}
+}
+
 func TestSMTP_Storage_TerminalFailure_451AndFailedRow(t *testing.T) {
 	f := startListener(t, baseTestConfig())
 	gate := attachTestGate(t, f)

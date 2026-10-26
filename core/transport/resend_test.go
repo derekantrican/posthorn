@@ -168,6 +168,105 @@ func TestResend_429_RateLimited(t *testing.T) {
 	}
 }
 
+// pinResendClock fixes resendNow at *now for the test; advance it by
+// assigning through the pointer.
+func pinResendClock(t *testing.T, now *time.Time) {
+	t.Helper()
+	old := resendNow
+	resendNow = func() time.Time { return *now }
+	t.Cleanup(func() { resendNow = old })
+}
+
+func TestResend_429_DailyQuota_QuotaExceededUntilMidnightUTC(t *testing.T) {
+	now := time.Date(2026, 10, 25, 17, 30, 0, 0, time.UTC)
+	pinResendClock(t, &now)
+
+	cs := newCaptureServer(t, http.StatusTooManyRequests,
+		`{"statusCode":429,"message":"You have exceeded your daily email sending quota.","name":"daily_quota_exceeded"}`)
+	tp := NewResendTransport("k", cs.URL)
+
+	_, err := tp.Send(context.Background(), goodResendMessage())
+	var te *TransportError
+	if !errors.As(err, &te) {
+		t.Fatalf("not a *TransportError: %v", err)
+	}
+	if te.Class != ErrQuotaExceeded {
+		t.Errorf("Class = %v, want ErrQuotaExceeded", te.Class)
+	}
+	if want := time.Date(2026, 10, 26, 0, 0, 0, 0, time.UTC); !te.RetryAfter.Equal(want) {
+		t.Errorf("RetryAfter = %v, want %v", te.RetryAfter, want)
+	}
+	if te.Message != "You have exceeded your daily email sending quota." {
+		t.Errorf("Message = %q", te.Message)
+	}
+}
+
+func TestResend_DailyQuota_FailsFastUntilReset(t *testing.T) {
+	now := time.Date(2026, 10, 25, 23, 0, 0, 0, time.UTC)
+	pinResendClock(t, &now)
+
+	cs := newCaptureServer(t, http.StatusTooManyRequests,
+		`{"statusCode":429,"message":"daily quota","name":"daily_quota_exceeded"}`)
+	tp := NewResendTransport("k", cs.URL)
+
+	_, _ = tp.Send(context.Background(), goodResendMessage())
+	_, err := tp.Send(context.Background(), goodResendMessage())
+	if cs.hits != 1 {
+		t.Errorf("hits = %d, want 1 (second send should fail fast without calling Resend)", cs.hits)
+	}
+	var te *TransportError
+	if !errors.As(err, &te) || te.Class != ErrQuotaExceeded {
+		t.Fatalf("cached err = %v, want ErrQuotaExceeded", err)
+	}
+
+	// Once midnight UTC passes, sends reach Resend again.
+	now = time.Date(2026, 10, 26, 0, 0, 1, 0, time.UTC)
+	_, _ = tp.Send(context.Background(), goodResendMessage())
+	if cs.hits != 2 {
+		t.Errorf("hits = %d, want 2 (quota reset should clear the cache)", cs.hits)
+	}
+}
+
+func TestResend_429_MonthlyQuota_NoRetryAfterNoCache(t *testing.T) {
+	cs := newCaptureServer(t, http.StatusTooManyRequests,
+		`{"statusCode":429,"message":"You have exceeded your monthly email sending quota.","name":"monthly_quota_exceeded"}`)
+	tp := NewResendTransport("k", cs.URL)
+
+	_, err := tp.Send(context.Background(), goodResendMessage())
+	var te *TransportError
+	if !errors.As(err, &te) {
+		t.Fatalf("not a *TransportError: %v", err)
+	}
+	if te.Class != ErrQuotaExceeded {
+		t.Errorf("Class = %v, want ErrQuotaExceeded", te.Class)
+	}
+	if !te.RetryAfter.IsZero() {
+		t.Errorf("RetryAfter = %v, want zero (monthly reset date unknown)", te.RetryAfter)
+	}
+
+	_, _ = tp.Send(context.Background(), goodResendMessage())
+	if cs.hits != 2 {
+		t.Errorf("hits = %d, want 2 (monthly quota isn't cached)", cs.hits)
+	}
+}
+
+func TestNextUTCMidnight(t *testing.T) {
+	pdt := time.FixedZone("PDT", -7*3600)
+	for _, tt := range []struct {
+		in, want time.Time
+	}{
+		{time.Date(2026, 10, 25, 12, 0, 0, 0, time.UTC), time.Date(2026, 10, 26, 0, 0, 0, 0, time.UTC)},
+		{time.Date(2026, 10, 25, 0, 0, 0, 0, time.UTC), time.Date(2026, 10, 26, 0, 0, 0, 0, time.UTC)},
+		{time.Date(2026, 12, 31, 23, 59, 0, 0, time.UTC), time.Date(2027, 1, 1, 0, 0, 0, 0, time.UTC)},
+		// 18:00 PDT on the 25th is already 01:00 UTC on the 26th.
+		{time.Date(2026, 10, 25, 18, 0, 0, 0, pdt), time.Date(2026, 10, 27, 0, 0, 0, 0, time.UTC)},
+	} {
+		if got := nextUTCMidnight(tt.in); !got.Equal(tt.want) {
+			t.Errorf("nextUTCMidnight(%v) = %v, want %v", tt.in, got, tt.want)
+		}
+	}
+}
+
 func TestResend_4xx_Terminal(t *testing.T) {
 	for _, status := range []int{400, 401, 403, 422} {
 		t.Run(http.StatusText(status), func(t *testing.T) {

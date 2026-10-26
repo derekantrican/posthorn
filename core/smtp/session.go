@@ -456,7 +456,7 @@ func (s *session) handleDATA() {
 				s.l.gate.ReportError(serr)
 			}
 		}
-		_ = s.writeReply(451, "4.0.0 Upstream transport failed")
+		_ = s.writeReply(451, sendFailureReply(sendErr))
 		s.logger.Error("smtp_submission_failed",
 			slog.String("submission_id", submissionID),
 			slog.String("error", sendErr.Error()),
@@ -582,6 +582,61 @@ func (s *session) recordSendFailed(err error) {
 		cls = te.Class.String()
 	}
 	s.l.recorder.Failed("smtp_listener", s.l.cfg.Transport.Type, cls)
+}
+
+// maxReplyMessageLen caps the upstream message echoed in a 451 reply,
+// keeping the line well under RFC 5321's 512-octet reply limit.
+const maxReplyMessageLen = 200
+
+// sendFailureReply is the text of the 451 reply for a failed send. A quota
+// error tells the client why and, when known, when the quota resets:
+//
+//	4.7.0 quota_exceeded retry_after=2026-10-26T00:00:00Z <provider message>
+//
+// so a client can defer the rest of its sends instead of failing them one
+// by one. Every other failure keeps the generic text.
+func sendFailureReply(err error) string {
+	var te *transport.TransportError
+	if !errors.As(err, &te) || te.Class != transport.ErrQuotaExceeded {
+		return "4.0.0 Upstream transport failed"
+	}
+
+	reply := "4.7.0 quota_exceeded"
+	if !te.RetryAfter.IsZero() {
+		reply += " retry_after=" + te.RetryAfter.UTC().Format(time.RFC3339)
+	}
+	if msg := replySafeText(te.Message, maxReplyMessageLen); msg != "" {
+		reply += " " + msg
+	}
+	return reply
+}
+
+// replySafeText reduces upstream-controlled text to printable ASCII on a
+// single line (no CR/LF can end the reply early or inject another one),
+// collapses whitespace runs, and truncates to max bytes.
+func replySafeText(s string, max int) string {
+	var b strings.Builder
+	space := false
+	for _, r := range s {
+		switch {
+		case r == ' ' || r == '\t' || r == '\r' || r == '\n':
+			space = b.Len() > 0
+		case r > ' ' && r <= '~':
+			if space {
+				b.WriteByte(' ')
+				space = false
+			}
+			b.WriteRune(r)
+		}
+		if b.Len() >= max {
+			break
+		}
+	}
+	out := b.String()
+	if len(out) > max {
+		out = out[:max]
+	}
+	return out
 }
 
 func (s *session) resetTransaction() {

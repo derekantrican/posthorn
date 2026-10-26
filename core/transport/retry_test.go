@@ -82,6 +82,22 @@ func TestSendWithRetry_Terminal_NoRetry(t *testing.T) {
 	}
 }
 
+func TestSendWithRetry_QuotaExceeded_NoRetryNotRetryable(t *testing.T) {
+	shortDelays(t)
+	quota := &TransportError{Class: ErrQuotaExceeded, Status: 429, Message: "daily quota"}
+	st := &scriptedTransport{errs: []error{quota}}
+	_, err := SendWithRetry(context.Background(), st, Message{}, discardLogger())
+	if !errors.Is(err, quota) {
+		t.Fatalf("err = %v, want the quota error", err)
+	}
+	if st.calls != 1 {
+		t.Errorf("calls = %d, want 1 (no retry on quota exceeded)", st.calls)
+	}
+	if IsRetryable(quota) {
+		t.Error("IsRetryable = true, want false (quota errors must not be queued)")
+	}
+}
+
 func TestSendWithRetry_NonTransportError_NoRetry(t *testing.T) {
 	shortDelays(t)
 	plain := errors.New("caller contract violation")

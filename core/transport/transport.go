@@ -3,6 +3,7 @@ package transport
 import (
 	"context"
 	"fmt"
+	"time"
 )
 
 // Message is the canonical form of an email passed to a Transport.
@@ -87,6 +88,7 @@ type Transport interface {
 //	ErrTransient    → retry once after 1s   (network errors, 5xx)
 //	ErrRateLimited  → retry once after 5s   (429 from upstream)
 //	ErrTerminal     → no retry, log + 502   (4xx other than 429)
+//	ErrQuotaExceeded→ no retry, not queued  (provider sending quota used up)
 //	ErrUnknown      → treated as terminal   (defensive default)
 type ErrorClass int
 
@@ -106,6 +108,12 @@ const (
 	// ErrTerminal is for failures that won't succeed on retry: 4xx responses
 	// (other than 429), malformed config, authentication errors.
 	ErrTerminal
+
+	// ErrQuotaExceeded is for a provider sending quota (daily/monthly) that
+	// is used up. Retrying before the quota resets cannot succeed, so it is
+	// neither retried inline nor queued; TransportError.RetryAfter carries
+	// the reset time when the provider's reset schedule is known.
+	ErrQuotaExceeded
 )
 
 // String returns a stable label for log fields (NFR7 error_class).
@@ -117,6 +125,8 @@ func (c ErrorClass) String() string {
 		return "rate_limited"
 	case ErrTerminal:
 		return "terminal"
+	case ErrQuotaExceeded:
+		return "quota_exceeded"
 	default:
 		return "unknown"
 	}
@@ -140,6 +150,11 @@ type TransportError struct {
 	// Message is a short operator-facing description. Should not contain
 	// secrets (API keys, request bodies). NFR3.
 	Message string
+
+	// RetryAfter is the earliest time a retry can succeed, when known.
+	// Set for ErrQuotaExceeded when the provider's quota reset time is
+	// known; zero otherwise.
+	RetryAfter time.Time
 }
 
 // Error implements the error interface. Format is intentionally compact and

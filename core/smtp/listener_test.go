@@ -9,6 +9,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/base64"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"math/big"
 	"net"
@@ -999,6 +1000,81 @@ func TestSMTP_TerminalUpstream_NoRetry_451(t *testing.T) {
 	}
 	if got := len(f.mt.Sent()); got != 1 {
 		t.Errorf("Send calls = %d, want 1 (no retry on terminal)", got)
+	}
+}
+
+func TestSMTP_QuotaExceeded_451WithRetryAfter(t *testing.T) {
+	// A used-up provider quota isn't retried, and the 451 tells the
+	// client why and when the quota resets so it can defer its sends.
+	f := startListener(t, baseTestConfig())
+	f.mt.errQueue = []error{
+		&transport.TransportError{
+			Class:      transport.ErrQuotaExceeded,
+			Status:     429,
+			Message:    "You have exceeded your daily email sending quota.",
+			RetryAfter: time.Date(2026, 10, 26, 0, 0, 0, 0, time.UTC),
+		},
+	}
+	code, msg := deliverBasic(t, f)
+	if code != 451 {
+		t.Fatalf("DATA response = %d, want 451 on quota exceeded", code)
+	}
+	want := "4.7.0 quota_exceeded retry_after=2026-10-26T00:00:00Z You have exceeded your daily email sending quota."
+	if msg != want {
+		t.Errorf("reply = %q, want %q", msg, want)
+	}
+	if got := len(f.mt.Sent()); got != 1 {
+		t.Errorf("Send calls = %d, want 1 (no retry on quota exceeded)", got)
+	}
+}
+
+func TestSendFailureReply(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		err  error
+		want string
+	}{
+		{
+			"terminal_stays_generic",
+			&transport.TransportError{Class: transport.ErrTerminal, Message: "bad payload"},
+			"4.0.0 Upstream transport failed",
+		},
+		{
+			"non_transport_error",
+			errors.New("boom"),
+			"4.0.0 Upstream transport failed",
+		},
+		{
+			"quota_without_reset_time",
+			&transport.TransportError{Class: transport.ErrQuotaExceeded, Message: "monthly quota"},
+			"4.7.0 quota_exceeded monthly quota",
+		},
+		{
+			"retry_after_rendered_in_utc",
+			&transport.TransportError{
+				Class:      transport.ErrQuotaExceeded,
+				RetryAfter: time.Date(2026, 10, 25, 17, 0, 0, 0, time.FixedZone("PDT", -7*3600)),
+			},
+			"4.7.0 quota_exceeded retry_after=2026-10-26T00:00:00Z",
+		},
+		{
+			"upstream_crlf_cannot_inject_a_reply",
+			&transport.TransportError{Class: transport.ErrQuotaExceeded, Message: "quota\r\n250 OK\tfake  "},
+			"4.7.0 quota_exceeded quota 250 OK fake",
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := sendFailureReply(tt.err); got != tt.want {
+				t.Errorf("got %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestReplySafeText_Truncates(t *testing.T) {
+	got := replySafeText(strings.Repeat("a", 500), maxReplyMessageLen)
+	if len(got) != maxReplyMessageLen {
+		t.Errorf("len = %d, want %d", len(got), maxReplyMessageLen)
 	}
 }
 
